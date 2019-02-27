@@ -20,10 +20,18 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <algorithm>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include <iostream>
+#include <map>
+#include <string>
 #include <iostream>
 #include <fstream>
+#include <vector>
 #include <unistd.h> // For ::getopt
 #include <string>
+#include <NvInfer.h>
 #include "NvOnnxParser.h"
 #include "onnx_utils.hpp"
 #include "common.hpp"
@@ -31,6 +39,17 @@
 using std::cout;
 using std::cerr;
 using std::endl;
+
+#define CHECK(status)                                          \
+    do                                                         \
+    {                                                          \
+        auto ret = (status);                                   \
+        if (ret != 0)                                          \
+        {                                                      \
+            std::cout << "Cuda failure: " << ret << std::endl; \
+            abort();                                           \
+        }                                                      \
+    } while (0)
 
 void print_usage() {
   cout << "This program will determine whether or not an ONNX model is compatible with TensorRT. " 
@@ -59,6 +78,82 @@ void printSubGraphs(SubGraphCollection_t& subGraphs, ::ONNX_NAMESPACE::ModelProt
     }
 }
 
+static std::map<std::string, std::string> getInputOutputNames(const nvinfer1::ICudaEngine& trt_engine)
+{
+    int nbindings = trt_engine.getNbBindings();
+    assert(nbindings == 2);
+    std::map<std::string, std::string> tmp;
+    for (int b = 0; b < nbindings; ++b)
+    {
+        if (trt_engine.bindingIsInput(b))
+        {
+            tmp["input"] = trt_engine.getBindingName(b);
+        }
+        else
+        {
+            tmp["output"] = trt_engine.getBindingName(b);
+        }
+    }
+    return tmp;
+}
+
+static int volume(nvinfer1::Dims dims)
+{
+    return std::accumulate(dims.d, dims.d + dims.nbDims, 1, std::multiplies<int>());
+}
+
+static void doInference(nvinfer1::ICudaEngine& trt_engine,
+                void ** buffers,
+                std::vector <float>& input,
+                std::vector <float>& output)
+{
+    // First dim = batch size = 3.
+    int batchSize = 3;
+    cudaStream_t stream;
+    CHECK(cudaStreamCreate(&stream));
+    // Get input and output binding names
+    std::map<std::string, std::string> InOut = getInputOutputNames(trt_engine);
+    const int inputIndex = trt_engine.getBindingIndex(InOut["input"].c_str()), outputIndex = trt_engine.getBindingIndex(InOut["output"].c_str());
+
+    cout << "input index " << inputIndex << endl;
+    cout << "output index " << outputIndex << endl;
+
+    nvinfer1::Dims inp_dims = trt_engine.getBindingDimensions(inputIndex);
+    nvinfer1::Dims output_dims = trt_engine.getBindingDimensions(outputIndex);
+
+    size_t inputDim = volume(inp_dims);
+    size_t outputDim = volume(output_dims);
+    output.resize(outputDim*batchSize);
+
+    // Get total memory size of input and output 
+    size_t input_size = batchSize * inputDim * sizeof(float);
+    size_t output_size = batchSize * outputDim * sizeof(float);
+    CHECK(cudaMalloc(&buffers[inputIndex], input_size));
+    CHECK(cudaMalloc(&buffers[outputIndex], output_size));
+
+    CHECK(cudaStreamCreate(&stream));
+
+    // Copy the input data over to the input buffer
+    CHECK(cudaMemcpyAsync(buffers[inputIndex], input.data(), input_size, cudaMemcpyHostToDevice, stream));
+
+    nvinfer1::IExecutionContext* context = trt_engine.createExecutionContext();
+    // Enqueue to context, with batchSize = 3.
+    context->enqueue(batchSize, buffers, stream, nullptr);
+
+    // Copy output data bck to the output buffer
+    CHECK(cudaMemcpyAsync(output.data(), buffers[outputIndex], output_size, cudaMemcpyDeviceToHost, stream));
+
+    CHECK(cudaStreamSynchronize(stream));
+
+    CHECK(cudaStreamDestroy(stream));
+
+    CHECK(cudaFree(buffers[inputIndex]));
+
+    CHECK(cudaFree(buffers[outputIndex]));
+
+    context->destroy();
+}
+
 
 int main(int argc, char* argv[]) {
 
@@ -70,7 +165,7 @@ int main(int argc, char* argv[]) {
     std::string onnx_filename;
     int c;
     size_t max_batch_size = 32;
-    size_t max_workspace_size = 1 << 30;
+    size_t max_workspace_size = 16 << 20;
     int verbosity = (int)nvinfer1::ILogger::Severity::kWARNING;
     while ((c = getopt (argc, argv, "m:e:")) != -1)
     {
@@ -110,12 +205,7 @@ int main(int argc, char* argv[]) {
     }
 
     ::ONNX_NAMESPACE::ModelProto onnx_model;
-    if (!trt_parser->parseFromFile(onnx_buf.data(), verbosity))
-    {
-        cout << "Failure while parsing ONNX file" << endl;
-        return 1;
-
-    }
+    common::ParseFromFile_WAR(&onnx_model, onnx_filename.c_str());
 
     SubGraphCollection_t SubGraphCollection;
 
@@ -128,26 +218,35 @@ int main(int argc, char* argv[]) {
 
     printSubGraphs(SubGraphCollection, onnx_model);
     
-    if( !engine_filename.empty() ) {
-        trt_builder->setMaxBatchSize(max_batch_size);
-        trt_builder->setMaxWorkspaceSize(max_workspace_size);
-        trt_parser->parse(onnx_buf.data(), onnx_buf.size());
+    trt_builder->setMaxBatchSize(max_batch_size);
+    trt_builder->setMaxWorkspaceSize(max_workspace_size);
+    trt_parser->parse(onnx_buf.data(), onnx_buf.size());
 
-        cout << "input name: " << trt_network->getInput(0)->getName() << endl;
-        cout << "output name: " << trt_network->getOutput(0)->getName() << endl;
-        cout << "num layers: " << trt_network->getNbLayers() << endl;
-        cout << "outputs: " << trt_network->getNbOutputs() << endl;
-
-        auto trt_engine = common::infer_object(trt_builder->buildCudaEngine(*trt_network.get()));
-    
-        if( verbosity >= (int)nvinfer1::ILogger::Severity::kWARNING ) {
-            cout << "Writing TensorRT engine to " << engine_filename << endl;
-        }
-        auto engine_plan = common::infer_object(trt_engine->serialize());
-        std::ofstream engine_file(engine_filename.c_str(), std::ios::binary);
-        engine_file.write(reinterpret_cast<const char*>(engine_plan->data()), engine_plan->size());
-        engine_file.close();
+    cout << "input name: " << trt_network->getInput(0)->getName() << endl;
+    cout << "output name: " << trt_network->getOutput(0)->getName() << endl;
+    cout << "num layers: " << trt_network->getNbLayers() << endl;
+    cout << "outputs: " << trt_network->getNbOutputs() << endl;
+    auto trt_engine = trt_builder->buildCudaEngine(*trt_network);
+    void* buffers[2];
+    std::vector<float>input;
+    // Create input data for abs.onnx. 3x4x5 = 60 total elements.
+    for (size_t i = 0; i < 60; i++)
+    {
+        input.push_back(i-30.0);
     }
+    std::vector<float>output;
+
+    // Do inference
+    doInference(*trt_engine, buffers, input, output);
+    for (size_t i = 0; i < 60; i++)
+    {
+        if (abs(input[i]) != output[i]) 
+        {
+            cout << "Failed" << endl;
+            cout << input[i] << "\t" << output[i] << endl;
+        }   
+    }
+    cout << "Done inference on 3D input" << endl;
     
     if( verbosity >= (int)nvinfer1::ILogger::Severity::kWARNING ) {
         cout << "All done" << endl;

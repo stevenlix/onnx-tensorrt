@@ -374,6 +374,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Concat)
     std::vector<nvinfer1::ITensor*> tensors;
     for (auto& input : inputs)
     {
+        // TRT does not support BOOL input types for this node
+        ASSERT(!input.isBool(), ErrorCode::kUNSUPPORTED_NODE);
         tensors.push_back(&convertToTensor(input, ctx));
     }
     OnnxAttrs attrs(node, ctx);
@@ -411,6 +413,7 @@ DEFINE_BUILTIN_OP_IMPORTER(ConstantOfShape)
         = ctx->createTempWeights(::ONNX_NAMESPACE::TensorProto_DataType_FLOAT, nvinfer1::Dims{1, 1});
     static_cast<float*>(zeroWeights.values)[0] = 0.f;
     auto valueWeights = TensorOrWeights{attrs.get("value", zeroWeights)};
+    ASSERT(valueWeights.weights().count() > 0 && "Failed to import ConstantOfShape's value tensor!", ErrorCode::kUNSUPPORTED_NODE);
 
     nvinfer1::ITensor* value = &convertToTensor(valueWeights, ctx);
     return {{constantOfShape(ctx, value, shape)}};
@@ -730,6 +733,8 @@ DEFINE_BUILTIN_OP_IMPORTER(DepthToSpace)
     // Input tensor is in NCHW format
     ASSERT(inputs.at(0).shape().nbDims == 4, ErrorCode::kUNSUPPORTED_NODE);
     nvinfer1::ITensor* tensorPtr = &convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT(tensorPtr->getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     auto dims = tensorPtr->getDimensions();
 
     // Extract attributes
@@ -879,6 +884,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Expand)
 {
     // "Broadcast the input tensor following the given shape and the broadcast rule."
     nvinfer1::ITensor* inputTensor = &convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT (inputTensor->getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     ShapeTensor inputDims = shapeOf(ctx, *inputTensor);
 
     // "A 1-D tensor indicates the shape you want to expand to, following the broadcast rule"
@@ -933,6 +940,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Floor)
 DEFINE_BUILTIN_OP_IMPORTER(Gather)
 {
     nvinfer1::ITensor& data = convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT(data.getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     nvinfer1::ITensor& indices = convertToTensor(inputs.at(1), ctx);
     OnnxAttrs attrs(node, ctx);
     int axis = attrs.get<int>("axis", 0);
@@ -951,6 +960,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm)
     bool transB = attrs.get("transB", false);
     nvinfer1::ITensor& inputA = convertToTensor(inputs.at(0), ctx);
     nvinfer1::ITensor* inputB = &convertToTensor(inputs.at(1), ctx);
+    // TRT does not support INT32 input types for this node
+    ASSERT(inputA.getType() == inputB->getType() && inputA.getType() != nvinfer1::DataType::kINT32, ErrorCode::kUNSUPPORTED_NODE);
 
     // Use FC if it is likely to be faster - which is usually when no Shuffles are required.
     bool canUseFC = inputs.at(0).is_tensor() && inputs.at(1).is_weights() && inputs.at(2).is_weights() && alpha == 1.f
@@ -1074,34 +1085,37 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm)
 
 DEFINE_BUILTIN_OP_IMPORTER(GlobalAveragePool)
 {
-    nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
-    nvinfer1::Dims dims = tensor.getDimensions();
-    int nbSpatialDims = dims.nbDims - 2;
-    ASSERT((nbSpatialDims == 2 || nbSpatialDims == 3) && "TensorRT only supports 2D and 3D pooling!",
-        ErrorCode::kUNSUPPORTED_NODE);
-    nvinfer1::Dims kernelSize = nbSpatialDims == 2
-        ? static_cast<nvinfer1::Dims>(nvinfer1::Dims2{dims.d[2], dims.d[3]})
-        : static_cast<nvinfer1::Dims>(nvinfer1::Dims3{dims.d[2], dims.d[3], dims.d[4]});
-    ASSERT(!isDynamic(kernelSize) && "Cannot run global average pool on an input with dynamic spatial dimensions!",
-        ErrorCode::kUNSUPPORTED_NODE);
-    RETURN_FIRST_OUTPUT(ctx->network()->addPoolingNd(tensor, nvinfer1::PoolingType::kAVERAGE, kernelSize));
+    return {{globalPoolingHelper(ctx, convertToTensor(inputs.at(0), ctx), nvinfer1::ReduceOperation::kAVG)}};
 }
 
-// TODO: GlobalLpPool: pow(reduce_mean(pow(abs(x), p)), 1./p)
+// GlobalLpPool: pow(reduce_sum(pow(x, p)), 1./p)
+DEFINE_BUILTIN_OP_IMPORTER(GlobalLpPool)
+{
+    auto& tensor = convertToTensor(inputs.at(0), ctx);
+    nvinfer1::Dims dims = tensor.getDimensions();
+
+    OnnxAttrs attrs{node, ctx};
+    float p = static_cast<float>(attrs.get("p", 2));
+
+    // Add constants for p and 1/p
+    nvinfer1::Dims scalarDims{dims.nbDims};
+    std::fill(scalarDims.d, scalarDims.d + scalarDims.nbDims, 1);
+    auto& pTensor = *addConstantScalar(ctx, p, ::ONNX_NAMESPACE::TensorProto::FLOAT, scalarDims)->getOutput(0);
+    auto& pInvTensor = *addConstantScalar(ctx, 1.f / p, ::ONNX_NAMESPACE::TensorProto::FLOAT, scalarDims)->getOutput(0);
+
+    // firstPow = pow(x, p)
+    auto* firstPow = ctx->network()->addElementWise(tensor, pTensor, nvinfer1::ElementWiseOperation::kPOW)->getOutput(0);
+    // reduced = reduce_sum(firstPow)
+    auto* reduced = globalPoolingHelper(ctx, *firstPow, nvinfer1::ReduceOperation::kSUM);
+    // finalPow = pow(reduced, 1./p)
+    auto* finalPow = ctx->network()->addElementWise(*reduced, pInvTensor, nvinfer1::ElementWiseOperation::kPOW)->getOutput(0);
+    return {{finalPow}};
+}
+
 
 DEFINE_BUILTIN_OP_IMPORTER(GlobalMaxPool)
 {
-    nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
-    nvinfer1::Dims dims = tensor.getDimensions();
-    int nbSpatialDims = dims.nbDims - 2;
-    ASSERT((nbSpatialDims == 2 || nbSpatialDims == 3) && "TensorRT only supports 2D and 3D pooling!",
-        ErrorCode::kUNSUPPORTED_NODE);
-    nvinfer1::Dims kernelSize = nbSpatialDims == 2
-        ? static_cast<nvinfer1::Dims>(nvinfer1::Dims2{dims.d[2], dims.d[3]})
-        : static_cast<nvinfer1::Dims>(nvinfer1::Dims3{dims.d[2], dims.d[3], dims.d[4]});
-    ASSERT(!isDynamic(kernelSize) && "Cannot run global average pool on an input with dynamic spatial dimensions!",
-        ErrorCode::kUNSUPPORTED_NODE);
-    RETURN_FIRST_OUTPUT(ctx->network()->addPoolingNd(tensor, nvinfer1::PoolingType::kMAX, kernelSize));
+    return {{globalPoolingHelper(ctx, convertToTensor(inputs.at(0), ctx), nvinfer1::ReduceOperation::kMAX)}};
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(Greater)
@@ -1995,7 +2009,8 @@ DEFINE_BUILTIN_OP_IMPORTER(MatMul)
 {
     nvinfer1::ITensor* inputA = &convertToTensor(inputs.at(0), ctx);
     nvinfer1::ITensor* inputB = &convertToTensor(inputs.at(1), ctx);
-
+    // TRT does not support INT32 input types for this node
+    ASSERT(inputA->getType() == inputB->getType() && inputA->getType() != nvinfer1::DataType::kINT32, ErrorCode::kUNSUPPORTED_NODE);
     broadcastTensors(ctx, inputA, inputB);
 
     constexpr auto getMatrixOp = [](const nvinfer1::ITensor& input) {
@@ -2188,27 +2203,13 @@ NodeImportResult randomUniformHelper(IImporterContext* ctx, const ShapeTensor& i
     auto low = attrs.get<float>("low", 0.f);
 
     // Set "low" and "high" values of the fillLayer.
-    // Set seed and dynamic "low" and "high" values if applicable
+    fillLayer->setAlpha(low);
+    fillLayer->setBeta(high);
+
+    // TensorRT does not support "seed" field now. The support will be added in future versions.
     if (attrs.count("seed"))
     {
-        // TensorRT's seed input must be an integer
-        int seed = static_cast<int>(attrs.get<float>("seed", 0.f));
-        // TensorRT requires dynamic "low" and "high" values if a seed is provided.
-        auto* alphaConstant
-            = addConstantScalar(ctx, low, ::ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
-        auto* betaConstant
-            = addConstantScalar(ctx, high, ::ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
-        auto* seedConstant
-            = addConstantScalar(ctx, seed, ::ONNX_NAMESPACE::TensorProto_DataType_INT32);
-        nvinfer1::ITensor* seedConstantTensor = seedConstant->getOutput(0);
-        fillLayer->setInput(1, *alphaConstant->getOutput(0));
-        fillLayer->setInput(2, *betaConstant->getOutput(0));
-        fillLayer->setInput(3, *seedConstantTensor);
-    }
-    else
-    {
-        fillLayer->setAlpha(low);
-        fillLayer->setBeta(high);
+        LOG_WARNING("TensorRT currently ignores the \"seed\" field in RandomUniform op. Random seeds will be used.");
     }
 
     RETURN_FIRST_OUTPUT(fillLayer);
@@ -2253,7 +2254,7 @@ NodeImportResult staticFloatRangeImporter(IImporterContext* ctx, const std::vect
 
 DEFINE_BUILTIN_OP_IMPORTER(Range)
 {
-    if (inputs.at(0).weights().type == ::ONNX_NAMESPACE::TensorProto_DataType_FLOAT)
+    if (inputs.at(0).is_weights() && inputs.at(0).weights().type == ::ONNX_NAMESPACE::TensorProto_DataType_FLOAT)
     {
         // Floating-point case supported by TensorRT only if all inputs are static.
         if (inputs.at(0).is_weights() && inputs.at(1).is_weights() && inputs.at(2).is_weights())
@@ -2416,6 +2417,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Reshape)
 DEFINE_BUILTIN_OP_IMPORTER(Resize)
 {
     nvinfer1::ITensor& input = convertToTensor(inputs.at(0), ctx);
+    // TRT does not support INT32 nor BOOL input types for this node
+    ASSERT(input.getType() != nvinfer1::DataType::kINT32 && input.getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     int inputRank = input.getDimensions().nbDims;
     ASSERT(inputRank > 0, ErrorCode::kUNSUPPORTED_NODE);
     // Add resize layer
@@ -2452,7 +2455,14 @@ DEFINE_BUILTIN_OP_IMPORTER(Resize)
     ASSERT(scales.is_weights() && "Resize scales must be an initializer!", ErrorCode::kUNSUPPORTED_NODE);
     ShapedWeights scales_weights = scales.weights();
     ASSERT(scales_weights.shape.nbDims == 1, ErrorCode::kUNSUPPORTED_NODE);
+    int scaleSize = scales_weights.shape.d[0];
+    ASSERT(scaleSize == inputRank, ErrorCode::kINVALID_NODE);
     float const* scaleValues = static_cast<float const*>(scales_weights.values);
+    if (resizeMode == nvinfer1::ResizeMode::kLINEAR)
+    {
+        ASSERT(canUseLinearResize(scaleSize, scaleValues),
+            ErrorCode::kUNSUPPORTED_NODE);
+    }
     layer->setResizeMode(resizeMode);
     layer->setScales(scaleValues, inputRank);
     RETURN_FIRST_OUTPUT(layer);
@@ -2827,6 +2837,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
     const int nbInputs = node.input().size();
     // "...it uses this information to slice the input data tensor."
     nvinfer1::ITensor& data = convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT(data.getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     const ShapeTensor dims = shapeOf(ctx, data);
 
     // "Slices uses starts, ends, axes and steps inputs to specify the start and
@@ -2991,6 +3003,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Split)
     // "input : T
     // The tensor to split"
     nvinfer1::ITensor& inputTensor = convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT(inputTensor.getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     const ShapeTensor inputDims = shapeOf(ctx, inputTensor);
 
     // "axis : int (default is 0)
@@ -3098,7 +3112,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Tan)
 
 DEFINE_BUILTIN_OP_IMPORTER(Tanh)
 {
-    RETURN_FIRST_OUTPUT(ctx->network()->addActivation(inputs.at(0).tensor(), nvinfer1::ActivationType::kTANH));
+    return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kTANH);
 }
 
 DEFINE_BUILTIN_OP_IMPORTER(ThresholdedRelu)
@@ -3113,6 +3127,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Tile)
     // "input : T
     // Input tensor of any shape."
     nvinfer1::ITensor& input = convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT(input.getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     const ShapeTensor inputDims = shapeOf(ctx, input);
 
     // "repeats : T1
@@ -3239,6 +3255,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Unsqueeze)
 DEFINE_BUILTIN_OP_IMPORTER(Upsample)
 {
     nvinfer1::ITensor& tensor = convertToTensor(inputs.at(0), ctx);
+    // TRT does not support BOOL input types for this node
+    ASSERT(tensor.getType() != nvinfer1::DataType::kINT32 && tensor.getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
     const int nbDims = tensor.getDimensions().nbDims;
     ASSERT(nbDims > 0, ErrorCode::kUNSUPPORTED_NODE);
     OnnxAttrs attrs(node, ctx);
@@ -3279,8 +3297,8 @@ DEFINE_BUILTIN_OP_IMPORTER(Upsample)
     nvinfer1::ResizeMode resizeMode = nvinfer1::ResizeMode::kNEAREST;
     if (mode == "linear")
     {
-        // Linear resize support 1-D, 2-D and 3D resize.
-        ASSERT((nbDims >= 1) && (nbDims <= 3), ErrorCode::kUNSUPPORTED_NODE);
+        ASSERT(canUseLinearResize(scale_factors.size(), &scale_factors.front()),
+            ErrorCode::kUNSUPPORTED_NODE);
         resizeMode = nvinfer1::ResizeMode::kLINEAR;
     }
     // Add resize layer
@@ -3295,7 +3313,9 @@ DEFINE_BUILTIN_OP_IMPORTER(Where)
     nvinfer1::ITensor* condition = &convertToTensor(inputs.at(0), ctx);
     nvinfer1::ITensor* x = &convertToTensor(inputs.at(1), ctx);
     nvinfer1::ITensor* y = &convertToTensor(inputs.at(2), ctx);
-
+    // TRT does not support BOOL input types for this node
+    ASSERT(x->getType() == y->getType() && x->getType() != nvinfer1::DataType::kBOOL, ErrorCode::kUNSUPPORTED_NODE);
+    
     broadcastTensors(ctx, x, y, condition);
 
     nvinfer1::Dims cDims = condition->getDimensions();

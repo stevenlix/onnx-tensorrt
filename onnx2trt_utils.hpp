@@ -124,24 +124,6 @@ inline nvinfer1::IConstantLayer* addConstant(
     return ctx->network()->addConstant(weights.shape, weights);
 }
 
-// Helper class to change output dimension calculations for pooling operators
-class CeilingPoolDim : public nvinfer1::IOutputDimensionsFormula
-{
-public:
-    nvinfer1::DimsHW compute(nvinfer1::DimsHW inputDims, nvinfer1::DimsHW kernelSize, nvinfer1::DimsHW stride,
-        nvinfer1::DimsHW padding, nvinfer1::DimsHW dilation, const char* layerName) const
-    {
-        nvinfer1::DimsHW outputDims;
-        for (int dimension = 0; dimension < inputDims.nbDims; ++dimension)
-        {
-            outputDims.d[dimension] = static_cast<int>(ceil(
-                (inputDims.d[dimension] + padding.d[dimension] * 2.0 - kernelSize.d[dimension]) / stride.d[dimension]
-                + 1.0));
-        }
-        return outputDims;
-    }
-};
-
 enum ScaleOp
 {
     kSHIFT,
@@ -165,6 +147,9 @@ Status broadcastTensors(IImporterContext* ctx, nvinfer1::ITensor*& t1, nvinfer1:
 
 // Helper function to broadcast three tensors to the largest one's shape
 Status broadcastTensors(IImporterContext* ctx, nvinfer1::ITensor*& t1, nvinfer1::ITensor*& t2, nvinfer1::ITensor*& t3);
+
+// Helper function to check that linear resize can be used
+bool canUseLinearResize(const size_t scaleSize, const float* scaleFactors);
 
 // Helper function for constantOfShape operator. Input shape must be a shape tensor
 nvinfer1::ITensor* constantOfShape(IImporterContext* ctx, nvinfer1::ITensor* constant, nvinfer1::ITensor* shape);
@@ -201,6 +186,9 @@ bool convertWeightDescriptor(
 
 // Helper function to provide a ceiling-rounding division between two integers
 int divCeil(int n, int d);
+
+// Helper function to check that the input data types for an elementwise operation are supported
+bool elementwiseCheck(const std::vector<TensorOrWeights>& inputs, const nvinfer1::ElementWiseOperation op);
 
 // Helper function to import an ONNX elementwise op into TRT
 NodeImportResult elementwiseHelper(IImporterContext* ctx, ::ONNX_NAMESPACE::NodeProto const& node,
@@ -239,18 +227,24 @@ const char* getDtypeName(int32_t onnxDtype);
 void getKernelParams(IImporterContext* ctx, ::ONNX_NAMESPACE::NodeProto const& onnx_node, nvinfer1::Dims* kernel_size,
     nvinfer1::Dims* strides, nvinfer1::Dims* beg_padding, nvinfer1::Dims* end_padding,
     nvinfer1::PaddingMode& paddingMode, bool& count_exclude_padding, nvinfer1::Dims* dilations = nullptr,
-    nvinfer1::Dims* output_padding = nullptr);
+    nvinfer1::Dims* output_padding = nullptr, const bool poolingCeilMode = false);
 
 // Helper function to get the scaling mode for TRT's scale layer
 nvinfer1::ScaleMode getScaleMode(nvinfer1::Dims const& weights_shape, nvinfer1::Dims const& tensor_shape);
 
-// Helper function to determine if a shape contains dynamic dimensions
-bool isDynamic(const nvinfer1::Dims& shape);
+// Helper function to map ONNX Global Pooling ops into TensorRT.
+nvinfer1::ITensor* globalPoolingHelper(IImporterContext* ctx, nvinfer1::ITensor& tensor, nvinfer1::ReduceOperation op);
 
 // Helper function to get a plugin from the PluginRegistry
 nvinfer1::IPluginV2* importPluginFromRegistry(IImporterContext* ctx, const std::string& pluginName,
     const std::string& pluginVersion, const std::string& nodeName,
     const std::vector<nvinfer1::PluginField>& pluginFields);
+
+// Helper function to determine if a shape contains dynamic dimensions
+bool isDynamic(const nvinfer1::Dims& shape);
+
+// Helper function to determine if a ONNX tensor is empty
+bool isOnnxTensorEmpty(const ::ONNX_NAMESPACE::TensorProto& onnxTensor);
 
 // Helper function to determine if a transpose is required
 bool isTransposeRequired(nvinfer1::Dims const& shape, nvinfer1::Permutation const& perm);

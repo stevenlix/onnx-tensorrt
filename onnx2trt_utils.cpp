@@ -1576,6 +1576,7 @@ NodeImportResult unaryHelper(IImporterContext* ctx, TensorOrWeights& input, nvin
     // Support scalar inputs by unsqueezing to 1D
     if (rank == 0)
     {
+        ASSERT(op != nvinfer1::UnaryOperation::kCEIL && op != nvinfer1::UnaryOperation::kFLOOR, ErrorCode::kUNSUPPORTED_NODE);
         std::vector<int> axes{0};
         tensorPtr = unsqueezeTensor(ctx, *tensorPtr, axes);
     }

@@ -54,6 +54,7 @@ using StringMap = std::unordered_map<std::string, T>;
 class IImporterContext
 {
 public:
+    virtual StringMap<std::string>& loopTensors() = 0;
     virtual nvinfer1::INetworkDefinition* network() = 0;
     virtual StringMap<TensorOrWeights>& tensors() = 0;
     virtual StringMap<nvinfer1::TensorLocation>& tensorLocations() = 0;

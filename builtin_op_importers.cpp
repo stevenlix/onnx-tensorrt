@@ -1681,6 +1681,10 @@ DEFINE_BUILTIN_OP_IMPORTER(LogSoftmax)
     RETURN_FIRST_OUTPUT(reshapeLayer);
 }
 
+//Disable Loop here as it conflicts with ORT graph partitioning. ORT will
+//iterate into each Loop op and send its subgraph to TRT for parsing, so 
+//the subgraph could still run on TRT depending on TRT capability
+/*
 DEFINE_BUILTIN_OP_IMPORTER(Loop)
 {
     constexpr int NB_NON_STATE_INPUTS = 2; // First 2 inputs are trip count and condition respectively.
@@ -1771,6 +1775,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Loop)
 
     return {nodeOutputs};
 }
+*/
 
 DEFINE_BUILTIN_OP_IMPORTER(LRN)
 {
@@ -2744,6 +2749,10 @@ DEFINE_BUILTIN_OP_IMPORTER(ScaledTanh)
     return activationHelper(ctx, node, inputs, nvinfer1::ActivationType::kSCALED_TANH, &alpha, &beta);
 }
 
+//Disable Scan here as it conflicts with ORT graph partitioning. ORT will
+//iterate into each Scan op and send its subgraph to TRT for parsing, so 
+//the subgraph could still run on TRT depending on TRT capability
+/*
 DEFINE_BUILTIN_OP_IMPORTER(Scan)
 {
     OnnxAttrs attrs(node, ctx);
@@ -2853,6 +2862,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Scan)
 
     return {nodeOutputs};
 }
+*/
 
 DEFINE_BUILTIN_OP_IMPORTER(Selu)
 {

@@ -2919,7 +2919,7 @@ ShapeTensor decodeOnnxIndices(IImporterContext* ctx, const ShapeTensor& indices,
 }
 
 ShapeTensor computeSizes(IImporterContext* ctx, const ShapeTensor& starts, const ShapeTensor& ends,
-    const ShapeTensor& steps, const ShapeTensor& dims)
+    const ShapeTensor& steps, const ShapeTensor& shift, const ShapeTensor& dims)
 {
     if (steps.isAll(1))
     {
@@ -2931,10 +2931,9 @@ ShapeTensor computeSizes(IImporterContext* ctx, const ShapeTensor& starts, const
     {
         // "If a negative value is passed for step, it represents slicing backward."
         // Compute ceil((end-start)/step) using only operations available in TensorRT.
-        return sub(ctx, similar(dims, 0), floorDiv(ctx, sub(ctx, starts, ends), steps));
+        return sub(ctx, sub(ctx, similar(dims, 0), floorDiv(ctx, sub(ctx, starts, ends), steps)), shift);
     }
 }
-
 DEFINE_BUILTIN_OP_IMPORTER(Slice)
 {
     const int nbInputs = node.input().size();
@@ -2994,9 +2993,24 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
         isIota &= axis == j;
         ++j;
     }
+
     // Check for duplicate axes.
     ASSERT(std::unordered_set<int64_t>(axes.values.begin(), axes.values.end()).size() == axes.values.size(),
         ErrorCode::kINVALID_NODE);
+
+    // Shift final size calculation if needed. Note this only occurs when slicing backwards across the entire axis
+    ShapeTensor shift;
+    if (ends.valuesKnown())
+    {
+        shift = ends;
+        for (int64_t& val : shift.values)
+        {
+            if (val == static_cast<int64_t>(INT_MIN))
+            {
+                val = -1;
+            }
+        }
+    }
 
     if (axes.size < dims.size || !isIota)
     {
@@ -3006,15 +3020,17 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
         starts = interlace(ctx, similar(dims, 0), starts, subscripts);
         ends = interlace(ctx, dims, ends, subscripts);
         steps = interlace(ctx, similar(dims, 1), steps, subscripts);
+        shift = interlace(ctx, similar(dims, 0), shift, subscripts);
     }
 
     // "If a negative value is passed for any of the start or end indices,
     // it represents number of elements before the end of that dimension."
     starts = decodeOnnxIndices(ctx, starts, dims);
+
     ends = decodeOnnxIndices(ctx, ends, dims);
 
     // TensorRT uses sizes of the output dimensions instead of ends.
-    const ShapeTensor sizes = computeSizes(ctx, starts, ends, steps, dims);
+    const ShapeTensor sizes = computeSizes(ctx, starts, ends, steps, shift, dims);
 
     nvinfer1::ISliceLayer* slice = addSlice(ctx, data, starts, sizes, steps);
 

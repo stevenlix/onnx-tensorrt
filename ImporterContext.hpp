@@ -56,10 +56,6 @@ public:
         , _logger(logger)
     {
     }
-    virtual StringMap<std::string>& loopTensors() override
-    {
-        return mLoopTensors;
-    }
     virtual nvinfer1::INetworkDefinition* network() override
     {
         return _network;

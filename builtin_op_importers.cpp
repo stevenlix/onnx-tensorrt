@@ -1707,7 +1707,6 @@ DEFINE_BUILTIN_OP_IMPORTER(Loop)
     {
         tripLimit = convertToScalar(ctx, &convertToTensor(inputs[0], ctx));
         ASSERT(tripLimit, ErrorCode::kINVALID_NODE);
-        std::cout << "REGISTERING " << body.input(0).name() << " FOR ONNX TENSOR: " << node.input(0) << std::endl;
         ctx->loopTensors()[body.input(0).name()] = node.input(0);
         loop->addTripLimit(*tripLimit, nvinfer1::TripLimit::kCOUNT);
         ctx->registerTensor(tripLimit, body.input(0).name());
@@ -2940,10 +2939,11 @@ ShapeTensor computeSizes(IImporterContext* ctx, const ShapeTensor& starts, const
     else
     {
         // "If a negative value is passed for step, it represents slicing backward."
-        // Compute ceil((end-start)/step) using only operations available in TensorRT.
-        return sub(ctx, sub(ctx, similar(dims, 0), floorDiv(ctx, sub(ctx, starts, ends), steps)), shift);
+        // Compute ceil((end-start)/step) + shift using only operations available in TensorRT.
+        return add(ctx, sub(ctx, similar(dims, 0), floorDiv(ctx, sub(ctx, starts, ends), steps)), shift);
     }
 }
+
 DEFINE_BUILTIN_OP_IMPORTER(Slice)
 {
     const int nbInputs = node.input().size();
@@ -3007,6 +3007,24 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
     // Check for duplicate axes.
     ASSERT(std::unordered_set<int64_t>(axes.values.begin(), axes.values.end()).size() == axes.values.size(),
         ErrorCode::kINVALID_NODE);
+	// Create a shift shapeTensor. We need to add 1 to the size for any slice that cuts across an entire
+    // axis in reverse. It is 0 for all other slices.
+    ShapeTensor shift = shapeVector(0);
+    if (ends.valuesKnown())
+    {
+        shift = ends;
+        for (int64_t& val : shift.values)
+        {
+            if (val == static_cast<int64_t>(INT_MIN))
+            {
+                val = 1;
+            }
+            else
+            {
+                val = 0;
+            }
+        }
+    }
 
     // Shift final size calculation if needed. Note this only occurs when slicing backwards across the entire axis
     ShapeTensor shift;
@@ -3025,7 +3043,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
     if (axes.size < dims.size || !isIota)
     {
         // axes specify a subset of the dimensions, or out of order.
-        // Convert starts/ends/steps to complete in-order form.
+        // Convert starts/ends/steps/shift to complete in-order form.
         const ShapeTensor subscripts{axesToInterlaceSubscripts(axes.values, dims.size)};
         starts = interlace(ctx, similar(dims, 0), starts, subscripts);
         ends = interlace(ctx, dims, ends, subscripts);

@@ -88,6 +88,10 @@ public:
     {
         return mUnsupportedShapeTensors;
     }
+    virtual StringMap<std::string>& loopTensors() override
+    {
+        return mLoopTensors;
+    }
 
     // This actually handles weights as well, but is named this way to be consistent with the tensors()
     virtual void registerTensor(TensorOrWeights tensor, const std::string& basename) override

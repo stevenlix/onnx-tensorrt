@@ -3026,20 +3026,6 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
         }
     }
 
-    // Shift final size calculation if needed. Note this only occurs when slicing backwards across the entire axis
-    ShapeTensor shift;
-    if (ends.valuesKnown())
-    {
-        shift = ends;
-        for (int64_t& val : shift.values)
-        {
-            if (val == static_cast<int64_t>(INT_MIN))
-            {
-                val = -1;
-            }
-        }
-    }
-
     if (axes.size < dims.size || !isIota)
     {
         // axes specify a subset of the dimensions, or out of order.
@@ -3054,7 +3040,6 @@ DEFINE_BUILTIN_OP_IMPORTER(Slice)
     // "If a negative value is passed for any of the start or end indices,
     // it represents number of elements before the end of that dimension."
     starts = decodeOnnxIndices(ctx, starts, dims);
-
     ends = decodeOnnxIndices(ctx, ends, dims);
 
     // TensorRT uses sizes of the output dimensions instead of ends.

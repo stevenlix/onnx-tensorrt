@@ -426,7 +426,7 @@ bool ModelImporter::parseWithWeightDescriptors(void const* serialized_onnx_model
         _errors.push_back(status);
         return false;
     }
-/*
+
   //slx: Do sanity check for shape tensor inputs, make an error here.
   auto* network = _importer_ctx.network();
   int numInputs = network->getNbInputs();
@@ -442,7 +442,7 @@ bool ModelImporter::parseWithWeightDescriptors(void const* serialized_onnx_model
           return false;
       }
   }
-*/
+
     return true;
 }
 

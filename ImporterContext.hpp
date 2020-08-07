@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -26,11 +26,12 @@
 #include "onnx2trt_utils.hpp"
 
 #include <list>
+#include <set>
+#include <string>
 #include <unordered_map>
 
 namespace onnx2trt
 {
-
 class ImporterContext final : public IImporterContext
 {
     nvinfer1::INetworkDefinition* _network;
@@ -44,12 +45,18 @@ class ImporterContext final : public IImporterContext
     StringMap<float> mTensorRangeMins;
     StringMap<float> mTensorRangeMaxes;
     StringMap<nvinfer1::DataType> mLayerPrecisions;
-    StringMap<size_t>
-        mTensorNameCounts; // Keep track of how many times a tensor name shows up, to avoid duplicate naming in TRT.
-    StringMap<size_t>
-        mLayerNameCounts; // Keep track of how many times a tensor name shows up, to avoid duplicate naming in TRT.
-    std::unordered_set<std::string> mUnsupportedShapeTensors; // Container to hold any shape tensors that are the output of layers that do not support shape tensors.
-    StringMap<std::string> mLoopTensors; // Container to map subgraph tensors to their original outer graph names.
+    std::set<std::string> mTensorNames;                       // keep track of tensor names used so far,
+                                                              // to avoid duplicate naming in TRT.
+    std::set<std::string> mLayerNames;                        // keep track of layer names used so far,
+                                                              // to avoid duplicate naming in TRT.
+    int64_t mSuffixCounter = 0;                               // increasing suffix counter used to uniquify layer names.
+    std::unordered_set<std::string> mUnsupportedShapeTensors; // Container to hold any shape tensors that are
+                                                              // the output of layers that do not support
+                                                              // shape tensors.
+    StringMap<std::string> mLoopTensors;                      // Container to map subgraph tensors to
+                                                              // their original outer graph names.
+    std::string mOnnxFileLocation;                            // Keep track of the directory of the parsed ONNX file
+
 public:
     ImporterContext(nvinfer1::INetworkDefinition* network, nvinfer1::ILogger* logger)
         : _network(network)
@@ -88,14 +95,20 @@ public:
     {
         return mLoopTensors;
     }
-
-    // This actually handles weights as well, but is named this way to be consistent with the tensors()
+    virtual void setOnnxFileLocation(std::string location) override
+    {
+        mOnnxFileLocation = location;
+    }
+    virtual std::string getOnnxFileLocation() override
+    {
+        return mOnnxFileLocation;
+    }
+    // This actually handles weights as well, but is named this way to be
+    // consistent with the tensors()
     virtual void registerTensor(TensorOrWeights tensor, const std::string& basename) override
     {
         // TRT requires unique tensor names.
-        const std::string uniqueName
-            = mTensorNameCounts[basename] ? (basename + "_" + std::to_string(mTensorNameCounts[basename])) : basename;
-        ++mTensorNameCounts[basename];
+        const std::string uniqueName = generateUniqueName(mTensorNames, basename);
 
         if (tensor)
         {
@@ -113,8 +126,9 @@ public:
                     convertINT64(reinterpret_cast<int64_t*>(weights.values), weights.shape, ctx), weights.shape};
             }
         }
-        // Overwrite previous tensors registered with the same name (this only happens when there are subgraphs,
-        // and in that case, overwriting is the desired behavior).
+        // Overwrite previous tensors registered with the same name (this only
+        // happens when there are subgraphs, and in that case, overwriting is the
+        // desired behavior).
         this->tensors()[basename] = std::move(tensor);
     }
 
@@ -124,9 +138,7 @@ public:
         if (layer)
         {
             const std::string name = basename.empty() ? layer->getName() : basename;
-            const std::string uniqueName
-                = mLayerNameCounts[name] ? (name + "_" + std::to_string(mLayerNameCounts[name])) : name;
-            ++mLayerNameCounts[name];
+            const std::string uniqueName = generateUniqueName(mLayerNames, basename);
 
             auto* ctx = this; // To enable logging.
             LOG_VERBOSE("Registering layer: " << name << " for ONNX node: " << basename);
@@ -215,6 +227,22 @@ public:
             assert(_opsets.count(domain));
             return _opsets.at(domain);
         }
+    }
+
+private:
+    std::string generateUniqueName(std::set<std::string>& namesSet, const std::string& basename)
+    {
+        std::string candidate = basename;
+
+        while (namesSet.find(candidate) != namesSet.end())
+        {
+            candidate = basename + "_" + std::to_string(mSuffixCounter);
+            ++mSuffixCounter;
+        }
+
+        namesSet.insert(candidate);
+
+        return candidate;
     }
 };
 
